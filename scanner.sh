@@ -324,7 +324,10 @@ PHP_PATTERNS=(
     'assert\s*\(\s*\$_'
     'preg_replace\s*\(.*/[a-z]*e[a-z]*.'
     'create_function\s*\('
-    '\$[a-z0-9_]*\s*\(\s*\$_'
+    '\$[a-z0-9_]*\s*\(\s*\$_GET'
+    '\$[a-z0-9_]*\s*\(\s*\$_POST'
+    '\$[a-z0-9_]*\s*\(\s*\$_REQUEST'
+    '\$[a-z0-9_]*\s*\(\s*\$_COOKIE'
     'base64_decode\s*\(\s*\$_'
     '\${\s*\$_'
     'chr\s*\(\s*[0-9]+\s*\)\s*\.\s*chr'
@@ -465,6 +468,14 @@ if [ -n "$results" ]; then
             suspicious=true
         fi
         
+        # Skip $_shortcode_tags and other normal WordPress variables - not backdoors
+        if echo "$match_line" | grep -qiE '(\$_shortcode_tags|\$_args|\$handler|\$this)'; then
+            # Check if it's in a normal context (not eval/exec)
+            if ! echo "$match_line" | grep -qiE '(eval|exec|system|shell|assert|preg_replace.*e)'; then
+                continue  # False positive - normal WordPress variable usage
+            fi
+        fi
+        
         # Special check for preg_replace - only dangerous with modifier 'e'
         if echo "$match_line" | grep -qiE 'preg_replace'; then
             # Check if it has dangerous modifier 'e' (allows code execution)
@@ -481,12 +492,14 @@ if [ -n "$results" ]; then
         
         # Special check for call_user_func - only dangerous with $_GET/$_POST/$_REQUEST
         if echo "$match_line" | grep -qiE 'call_user_func'; then
+            # Skip elFinder completely - it's a legitimate file manager
+            if echo "$f" | grep -qiE "(elFinder|wp-file-manager)"; then
+                continue  # False positive - legitimate library
+            fi
             # Check if it's using user input directly
             if echo "$match_line" | grep -qiE "(call_user_func.*\$_GET|call_user_func.*\$_POST|call_user_func.*\$_REQUEST|call_user_func.*\$_COOKIE)"; then
                 # Using user input - potentially dangerous
-                if ! echo "$f" | grep -qiE "(elFinder|wp-file-manager)"; then
-                    suspicious=true
-                fi
+                suspicious=true
             else
                 # Normal callback usage - safe, skip it (false positive)
                 continue
@@ -495,14 +508,14 @@ if [ -n "$results" ]; then
         
         # Special check for fsockopen - check context
         if echo "$match_line" | grep -qiE 'fsockopen'; then
-            # If in WordPress core or known plugins, likely legitimate
+            # If in WordPress core or themes/plugins, check if using user input
             if is_wordpress_core "$f" || echo "$f" | grep -qiE "(wp-content/themes|wp-content/plugins)"; then
                 # Check if it's using user input directly (dangerous)
                 if echo "$match_line" | grep -qiE "(fsockopen.*\$_GET|fsockopen.*\$_POST|fsockopen.*\$_REQUEST)"; then
                     # Using user input - potentially dangerous
                     suspicious=true
                 else
-                    # Normal usage - safe, skip it (false positive)
+                    # Normal usage (like port checking) - safe, skip it (false positive)
                     continue
                 fi
             fi
@@ -510,12 +523,10 @@ if [ -n "$results" ]; then
         
         # Special check for base64_decode with $_COOKIE - check context
         if echo "$match_line" | grep -qiE 'base64_decode.*\$_COOKIE'; then
-            # If in known plugins (imagify, etc.), check if it's for file paths
+            # Skip known plugins that use this for legitimate file path handling
             if echo "$f" | grep -qiE "(imagify|wp-background-processing|deliciousbrains)"; then
-                if echo "$match_line" | grep -qiE "(file_path|filepath|path|directory|dir)"; then
-                    # Likely legitimate file path handling - skip it (false positive)
-                    continue
-                fi
+                # These plugins use base64_decode for file paths - legitimate
+                continue  # False positive - legitimate usage
             fi
         fi
         
@@ -585,7 +596,7 @@ find "$SCAN_PATH" -type f \( \
     -name "*hook*.js" \
 \) 2>/dev/null | grep -v node_modules | grep -v vendor | head -50 | while read f; do
     # Skip WordPress core class files (class-wp-*.php) - these are legitimate
-    if echo "$f" | grep -qiE "(wp-includes.*class-wp-|wp-admin.*class-wp-)"; then
+    if echo "$f" | grep -qiE "(class-wp-.*\.php|wp-includes.*class-wp-|wp-admin.*class-wp-)"; then
         continue  # Legitimate WordPress core class
     fi
     
