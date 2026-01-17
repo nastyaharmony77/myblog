@@ -1,10 +1,11 @@
 #!/bin/bash
-# Fast Scanner for PHP/JS
-# Usage: ./backdoor_scanner.sh [path] [--deep]
+# Enhanced Backdoor Scanner with Decoding
+# Usage: ./scanner.sh [path] [--deep]
 
 RED='\033[0;31m'
 YEL='\033[1;33m'
 GRN='\033[0;32m'
+CYN='\033[0;36m'
 NC='\033[0m'
 
 SCAN_PATH="${1:-.}"
@@ -15,7 +16,119 @@ echo -e "${YEL}[*] Started: $(date)${NC}"
 echo ""
 
 # Exclude dirs for speed
-EXCLUDE="--exclude-dir=node_modules --exclude-dir=vendor --exclude-dir=cache --exclude-dir=.git --exclude-dir=logs"
+EXCLUDE="--exclude-dir=node_modules --exclude-dir=vendor --exclude-dir=cache --exclude-dir=.git --exclude-dir=logs --exclude-dir=dist --exclude-dir=build"
+
+# Known legitimate library markers (to reduce false positives)
+LEGITIMATE_JS_MARKERS=(
+    "React"
+    "jQuery"
+    "WordPress"
+    "Gutenberg"
+    "@license"
+    "use-sync-external-store"
+    "webpack"
+    "babel"
+    "MIT license"
+    "Copyright"
+    "This file is auto-generated"
+)
+
+# Check if file is likely minified library
+is_likely_library() {
+    local file="$1"
+    local size=$(wc -c < "$file" 2>/dev/null || echo 0)
+    local lines=$(wc -l < "$file" 2>/dev/null || echo 0)
+    local avg_line_len=$((size / (lines + 1)))
+    
+    # Large files with very long lines are likely minified
+    if [ "$size" -gt 100000 ] && [ "$avg_line_len" -gt 500 ]; then
+        # Check for legitimate markers
+        for marker in "${LEGITIMATE_JS_MARKERS[@]}"; do
+            if grep -qi "$marker" "$file" 2>/dev/null; then
+                return 0  # Likely legitimate library
+            fi
+        done
+    fi
+    return 1
+}
+
+# Decode base64 string
+decode_base64() {
+    local str="$1"
+    echo "$str" | base64 -d 2>/dev/null | head -c 500
+}
+
+# Decode hex string
+decode_hex() {
+    local str="$1"
+    echo "$str" | sed 's/\\x//g' | xxd -r -p 2>/dev/null | head -c 500
+}
+
+# Decode ROT13
+decode_rot13() {
+    local str="$1"
+    echo "$str" | tr 'A-Za-z' 'N-ZA-Mn-za-m' | head -c 500
+}
+
+# Extract and decode suspicious patterns
+analyze_suspicious_code() {
+    local file="$1"
+    local pattern="$2"
+    local output_file="$3"
+    local line=$(grep -iE "$pattern" "$file" 2>/dev/null | head -1)
+    
+    if [ -z "$line" ]; then
+        return 1
+    fi
+    
+    # Try to extract encoded payload
+    local decoded=""
+    local suspicious=0
+    
+    # Base64 decode
+    if echo "$line" | grep -qiE 'base64_decode|atob'; then
+        local b64=$(echo "$line" | grep -oE '[A-Za-z0-9+/]{50,}={0,2}' | head -1)
+        if [ -n "$b64" ]; then
+            decoded=$(decode_base64 "$b64")
+            if echo "$decoded" | grep -qiE '(eval|exec|system|shell|passthru|base64|gzinflate|assert|preg_replace.*e)'; then
+                suspicious=1
+            fi
+        fi
+    fi
+    
+    # Hex decode
+    if echo "$line" | grep -qiE '\\x[0-9a-f]{2}'; then
+        local hex=$(echo "$line" | grep -oE '\\x[0-9a-f]{2}+' | head -1)
+        if [ -n "$hex" ]; then
+            decoded=$(decode_hex "$hex")
+            if echo "$decoded" | grep -qiE '(eval|exec|system|shell|passthru)'; then
+                suspicious=1
+            fi
+        fi
+    fi
+    
+    # ROT13 decode
+    if echo "$line" | grep -qiE 'str_rot13'; then
+        local rot13=$(echo "$line" | grep -oE '[A-Za-z]{20,}' | head -1)
+        if [ -n "$rot13" ]; then
+            decoded=$(decode_rot13 "$rot13")
+            if echo "$decoded" | grep -qiE '(eval|exec|system|shell)'; then
+                suspicious=1
+            fi
+        fi
+    fi
+    
+    if [ "$suspicious" -eq 1 ] && [ -n "$decoded" ]; then
+        if [ -n "$output_file" ]; then
+            echo -e "${CYN}    Decoded: ${decoded:0:200}...${NC}" > "$output_file"
+        else
+            echo -e "${CYN}    Decoded: ${decoded:0:200}...${NC}"
+        fi
+        return 0
+    fi
+    
+    return 1
+}
 
 # PHP Backdoor patterns (high confidence)
 PHP_PATTERNS=(
@@ -72,6 +185,33 @@ JS_PATTERNS=(
     'eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k'
 )
 
+# External domain connections to search for
+EXTERNAL_DOMAINS=(
+    'google-analytics\.com'
+    'googlesyndication\.com'
+    'googletagmanager\.com'
+    'googleapis\.com'
+    'gstatic\.com'
+    'doubleclick\.net'
+    'googleadservices\.com'
+    'facebook\.net'
+    'facebook\.com/tr'
+    'analytics\.facebook\.com'
+    'connect\.facebook\.net'
+    'yandex\.ru/metrika'
+    'mc\.yandex\.ru'
+    'top-fwz1\.mail\.ru'
+    'adfox\.ru'
+    'mycdn\.ru'
+    'cdn\.jsdelivr\.net'
+    'cdnjs\.cloudflare\.com'
+    'unpkg\.com'
+    'bootstrapcdn\.com'
+    'ajax\.googleapis\.com'
+    'fonts\.googleapis\.com'
+    'apis\.google\.com'
+)
+
 found=0
 
 echo -e "${RED}=== PHP Backdoors ===${NC}"
@@ -81,12 +221,48 @@ PHP_REGEX=$(IFS='|'; echo "${PHP_PATTERNS[*]}")
 results=$(grep -rliE "$PHP_REGEX" $EXCLUDE --include="*.php" "$SCAN_PATH" 2>/dev/null | head -100)
 if [ -n "$results" ]; then
     echo "$results" | while read f; do
-        echo -e "${RED}[!]${NC} $f"
-        # Show matching line
-        grep -iE "$PHP_REGEX" "$f" 2>/dev/null | head -1 | cut -c1-100
-        echo ""
+        # Get matching pattern
+        match_line=$(grep -iE "$PHP_REGEX" "$f" 2>/dev/null | head -1)
+        if [ -z "$match_line" ]; then
+            continue
+        fi
+        
+        # Try to decode and analyze
+        suspicious=false
+        decoded_output=""
+        tmp_file="/tmp/decoded_$$_$(basename "$f" | tr '/' '_')"
+        
+        for pattern in "${PHP_PATTERNS[@]}"; do
+            if analyze_suspicious_code "$f" "$pattern" "$tmp_file" 2>/dev/null; then
+                suspicious=true
+                if [ -f "$tmp_file" ]; then
+                    decoded_output=$(cat "$tmp_file")
+                    rm -f "$tmp_file"
+                fi
+                break
+            fi
+        done
+        
+        # Check for direct suspicious patterns (without encoding)
+        if echo "$match_line" | grep -qiE '(eval.*\$|assert.*\$|shell_exec.*\$|system.*\$|exec.*\$)'; then
+            suspicious=true
+        fi
+        
+        if [ "$suspicious" = true ]; then
+            echo -e "${RED}[!] SUSPICIOUS${NC} $f"
+            echo -e "${YEL}    Pattern: ${match_line:0:150}${NC}"
+            if [ -n "$decoded_output" ]; then
+                echo "$decoded_output"
+            fi
+            echo ""
+            found=1
+        else
+            echo -e "${YEL}[?] Check${NC} $f (pattern found but may be false positive)"
+            echo -e "${YEL}    Pattern: ${match_line:0:100}${NC}"
+            echo ""
+        fi
+        rm -f "$tmp_file" 2>/dev/null
     done
-    found=1
 fi
 
 # Signature scan
@@ -149,9 +325,117 @@ JS_REGEX=$(IFS='|'; echo "${JS_PATTERNS[*]}")
 results=$(grep -rliE "$JS_REGEX" $EXCLUDE --include="*.js" "$SCAN_PATH" 2>/dev/null | head -50)
 if [ -n "$results" ]; then
     echo "$results" | while read f; do
-        echo -e "${RED}[!]${NC} $f"
+        # Skip if likely a legitimate library
+        if is_likely_library "$f"; then
+            echo -e "${GRN}[~] SKIPPED (likely library)${NC} $f"
+            continue
+        fi
+        
+        # Get matching pattern
+        match_line=$(grep -iE "$JS_REGEX" "$f" 2>/dev/null | head -1)
+        if [ -z "$match_line" ]; then
+            continue
+        fi
+        
+        # Check if it's in a suspicious context (not in a library)
+        suspicious=false
+        
+        # Check for eval(atob) with suspicious decoded content
+        if echo "$match_line" | grep -qiE 'eval\s*\(\s*atob'; then
+            # Try to extract and decode base64
+            b64_match=$(echo "$match_line" | grep -oE 'atob\s*\(\s*["'"'"'][^"'"'"']{50,}["'"'"']' | sed "s/atob\s*(\s*['\"]//;s/['\"]\s*)//" | head -1)
+            if [ -n "$b64_match" ]; then
+                decoded=$(decode_base64 "$b64_match")
+                if echo "$decoded" | grep -qiE '(eval|Function|document\.write|XMLHttpRequest|fetch|WebSocket|child_process|exec|spawn)'; then
+                    suspicious=true
+                fi
+            fi
+        fi
+        
+        # Check for eval(unescape)
+        if echo "$match_line" | grep -qiE 'eval\s*\(\s*unescape'; then
+            suspicious=true
+        fi
+        
+        # Check for multiple String.fromCharCode (obfuscation)
+        if echo "$match_line" | grep -qiE 'String\.fromCharCode.*String\.fromCharCode.*String\.fromCharCode'; then
+            # Count occurrences - many means likely obfuscation
+            count=$(echo "$match_line" | grep -o 'String\.fromCharCode' | wc -l)
+            if [ "$count" -gt 5 ]; then
+                suspicious=true
+            fi
+        fi
+        
+        if [ "$suspicious" = true ]; then
+            echo -e "${RED}[!] SUSPICIOUS${NC} $f"
+            echo -e "${YEL}    Pattern: ${match_line:0:150}${NC}"
+            if [ -n "$decoded" ]; then
+                echo -e "${CYN}    Decoded: ${decoded:0:200}...${NC}"
+            fi
+            echo ""
+            found=1
+        else
+            echo -e "${YEL}[?] Check${NC} $f (pattern found but context unclear)"
+            echo -e "${YEL}    Pattern: ${match_line:0:100}${NC}"
+            echo ""
+        fi
     done
-    found=1
+fi
+
+# External domain connections
+echo -e "${CYN}=== External Domain Connections ===${NC}"
+DOMAIN_REGEX=$(IFS='|'; echo "${EXTERNAL_DOMAINS[*]}")
+results=$(grep -rliE "$DOMAIN_REGEX" $EXCLUDE --include="*.php" --include="*.js" --include="*.html" --include="*.htm" "$SCAN_PATH" 2>/dev/null | head -100)
+
+if [ -n "$results" ]; then
+    echo "$results" | while read f; do
+        # Skip if likely a legitimate library (for JS files)
+        if [[ "$f" == *.js ]] && is_likely_library "$f"; then
+            continue
+        fi
+        
+        # Get all matching domains in this file
+        domains_found=$(grep -oiE "$DOMAIN_REGEX" "$f" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+        
+        # Get context line
+        context_line=$(grep -iE "$DOMAIN_REGEX" "$f" 2>/dev/null | head -1)
+        
+        # Determine severity based on file location and type
+        severity="${YEL}[?]"
+        reason=""
+        
+        # Check if in suspicious location
+        if echo "$f" | grep -qiE '(upload|tmp|temp|cache|wp-content/uploads)'; then
+            severity="${RED}[!]"
+            reason=" (in upload/temp directory)"
+        fi
+        
+        # Check if in PHP file (more suspicious than JS/HTML)
+        if [[ "$f" == *.php ]]; then
+            # Check if it's a direct include/require or curl
+            if echo "$context_line" | grep -qiE '(include|require|curl|file_get_contents|fopen|fsockopen)'; then
+                severity="${RED}[!]"
+                reason=" (direct connection in PHP)"
+            else
+                severity="${YEL}[?]"
+                reason=" (domain reference in PHP)"
+            fi
+        fi
+        
+        # Check if domain is in encoded form (suspicious)
+        if echo "$context_line" | grep -qiE '(base64|atob|unescape|String\.fromCharCode|\\x[0-9a-f])'; then
+            severity="${RED}[!]"
+            reason=" (encoded/obfuscated domain)"
+        fi
+        
+        echo -e "${severity}${NC} $f${reason}"
+        echo -e "${CYN}    Domains: $domains_found${NC}"
+        echo -e "${YEL}    Context: ${context_line:0:150}${NC}"
+        echo ""
+        found=1
+    done
+else
+    echo -e "${GRN}[~] No external domain connections found${NC}"
 fi
 
 # Recently modified PHP (last 7 days)
@@ -162,13 +446,102 @@ if [ "$DEEP_SCAN" = "--deep" ]; then
         echo -e "${YEL}[?]${NC} $f ($(stat -c %y "$f" 2>/dev/null || stat -f %Sm "$f" 2>/dev/null))"
     done
     
-    # Base64 encoded content (long strings)
-    echo -e "${YEL}=== Long Base64 Strings ===${NC}"
+    # Base64 encoded content (long strings) with decoding
+    echo -e "${YEL}=== Long Base64 Strings (with decoding) ===${NC}"
     grep -rlE '[A-Za-z0-9+/]{200,}' $EXCLUDE --include="*.php" "$SCAN_PATH" 2>/dev/null | head -20 | while read f; do
-        echo -e "${YEL}[?]${NC} $f"
+        # Extract first long base64 string
+        b64_str=$(grep -oE '[A-Za-z0-9+/]{200,}' "$f" 2>/dev/null | head -1)
+        if [ -n "$b64_str" ]; then
+            decoded=$(decode_base64 "$b64_str" 2>/dev/null)
+            if [ -n "$decoded" ]; then
+                # Check if decoded content is suspicious
+                suspicious=false
+                if echo "$decoded" | grep -qiE '(eval|exec|system|shell|passthru|base64|gzinflate|assert|preg_replace.*e|file_get_contents|file_put_contents|fwrite|fopen|curl_exec|fsockopen)'; then
+                    suspicious=true
+                fi
+                
+                # Check for external domains in decoded content
+                domains_in_decoded=$(echo "$decoded" | grep -oiE "$DOMAIN_REGEX" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+                if [ -n "$domains_in_decoded" ]; then
+                    suspicious=true
+                    echo -e "${RED}[!] SUSPICIOUS${NC} $f (domain found in decoded base64)"
+                    echo -e "${CYN}    Domains in decoded: $domains_in_decoded${NC}"
+                    echo -e "${CYN}    Decoded preview: ${decoded:0:300}...${NC}"
+                elif [ "$suspicious" = true ]; then
+                    echo -e "${RED}[!] SUSPICIOUS${NC} $f"
+                    echo -e "${CYN}    Decoded preview: ${decoded:0:300}...${NC}"
+                else
+                    echo -e "${YEL}[?]${NC} $f (long base64 found, decoded content seems benign)"
+                fi
+            else
+                echo -e "${YEL}[?]${NC} $f (long base64 string found, couldn't decode)"
+            fi
+        fi
+    done
+    
+    # Check for obfuscated PHP (hex, rot13, etc.)
+    echo -e "${YEL}=== Obfuscated PHP Code ===${NC}"
+    grep -rlE '(\\x[0-9a-f]{2}{10,}|str_rot13|chr\s*\([0-9]+\s*\)\s*\.\s*chr)' $EXCLUDE --include="*.php" "$SCAN_PATH" 2>/dev/null | head -15 | while read f; do
+        match_line=$(grep -iE '(\\x[0-9a-f]{2}{10,}|str_rot13|chr\s*\([0-9]+\s*\)\s*\.\s*chr)' "$f" 2>/dev/null | head -1)
+        if [ -n "$match_line" ]; then
+            suspicious=false
+            decoded=""
+            
+            # Try hex decode
+            if echo "$match_line" | grep -qiE '\\x[0-9a-f]{2}'; then
+                hex_str=$(echo "$match_line" | grep -oE '\\x[0-9a-f]{2}+' | head -1)
+                if [ -n "$hex_str" ]; then
+                    decoded=$(decode_hex "$hex_str")
+                    if echo "$decoded" | grep -qiE '(eval|exec|system|shell|passthru|assert)'; then
+                        suspicious=true
+                    fi
+                    # Check for domains in decoded hex
+                    domains_in_decoded=$(echo "$decoded" | grep -oiE "$DOMAIN_REGEX" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+                    if [ -n "$domains_in_decoded" ]; then
+                        suspicious=true
+                    fi
+                fi
+            fi
+            
+            # Try ROT13
+            if echo "$match_line" | grep -qiE 'str_rot13'; then
+                rot13_str=$(echo "$match_line" | grep -oE '[A-Za-z]{30,}' | head -1)
+                if [ -n "$rot13_str" ]; then
+                    decoded=$(decode_rot13 "$rot13_str")
+                    if echo "$decoded" | grep -qiE '(eval|exec|system|shell)'; then
+                        suspicious=true
+                    fi
+                    # Check for domains in decoded ROT13
+                    domains_in_decoded=$(echo "$decoded" | grep -oiE "$DOMAIN_REGEX" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+                    if [ -n "$domains_in_decoded" ]; then
+                        suspicious=true
+                    fi
+                fi
+            fi
+            
+            if [ "$suspicious" = true ]; then
+                echo -e "${RED}[!] SUSPICIOUS${NC} $f"
+                echo -e "${YEL}    Pattern: ${match_line:0:150}${NC}"
+                if [ -n "$decoded" ]; then
+                    echo -e "${CYN}    Decoded: ${decoded:0:200}...${NC}"
+                    if [ -n "$domains_in_decoded" ]; then
+                        echo -e "${CYN}    Domains in decoded: $domains_in_decoded${NC}"
+                    fi
+                fi
+            else
+                echo -e "${YEL}[?]${NC} $f (obfuscation found, decoded content seems benign)"
+            fi
+        fi
     done
 fi
 
+# Cleanup
+rm -f /tmp/decoded_$$ 2>/dev/null
+
 echo ""
 echo -e "${GRN}[*] Completed: $(date)${NC}"
-echo -e "${YEL}[*] Tip: Use --deep for more thorough scan${NC}"
+echo -e "${YEL}[*] Tip: Use --deep for more thorough scan with decoding${NC}"
+echo -e "${CYN}[*] Legend:${NC}"
+echo -e "  ${RED}[!] SUSPICIOUS${NC} - High confidence backdoor detected"
+echo -e "  ${YEL}[?] Check${NC} - Pattern found, manual review recommended"
+echo -e "  ${GRN}[~] SKIPPED${NC} - Likely legitimate library, skipped"
