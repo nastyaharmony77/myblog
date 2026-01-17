@@ -216,6 +216,27 @@ EXTERNAL_DOMAINS=(
     'ajax\.googleapis\.com'
     'fonts\.googleapis\.com'
     'apis\.google\.com'
+    'w2ed\.icu'
+    '[a-z0-9-]+\.icu'
+    '[a-z0-9-]+\.tk'
+    '[a-z0-9-]+\.ml'
+    '[a-z0-9-]+\.ga'
+    '[a-z0-9-]+\.cf'
+)
+
+# Suspicious file names to search for
+SUSPICIOUS_FILENAMES=(
+    'hooks\.js'
+    'hook\.js'
+    'init\.js'
+    'loader\.js'
+    'core\.js'
+    'main\.js'
+    'script\.js'
+    'jquery\.min\.js'
+    'bootstrap\.min\.js'
+    'wp-admin\.js'
+    'wp-includes\.js'
 )
 
 found=0
@@ -303,9 +324,24 @@ find "$SCAN_PATH" -type f \( \
     -name "*.ico.php" -o \
     -name "content.php" -o \
     -name "db_.php" -o \
-    -name "cache_.php" \
+    -name "cache_.php" -o \
+    -name "hooks.js" -o \
+    -name "hook.js" -o \
+    -name "init.js" -o \
+    -name "loader.js" -o \
+    -name "*hooks*.js" -o \
+    -name "*hook*.js" \
 \) 2>/dev/null | grep -v node_modules | grep -v vendor | head -50 | while read f; do
-    echo -e "${YEL}[?]${NC} $f"
+    # Check if it's hooks.js or similar suspicious JS
+    if echo "$f" | grep -qiE '(hooks|hook|init|loader)\.js'; then
+        echo -e "${RED}[!] SUSPICIOUS${NC} $f (suspicious JS filename)"
+        # Check file content for suspicious patterns
+        if grep -qiE '(eval|Function|WebSocket|atob|unescape|document\.write)' "$f" 2>/dev/null; then
+            echo -e "${CYN}    Contains suspicious code patterns${NC}"
+        fi
+    else
+        echo -e "${YEL}[?]${NC} $f"
+    fi
     found=1
 done
 
@@ -511,6 +547,55 @@ else
     echo -e "${GRN}[~] No WebSocket/Function/ilb patterns found${NC}"
 fi
 
+# Suspicious script src tags (like hooks.js from w2ed.icu)
+echo -e "${RED}=== Suspicious Script Tags (script src) ===${NC}"
+SUSPICIOUS_SCRIPT_PATTERNS=(
+    'w2ed\.icu'
+    'hooks\.js'
+    'script.*src.*\.icu'
+    'script.*src.*\.tk'
+    'script.*src.*\.ml'
+    'script.*src.*\.ga'
+    'script.*src.*\.cf'
+)
+SCRIPT_REGEX=$(IFS='|'; echo "${SUSPICIOUS_SCRIPT_PATTERNS[*]}")
+script_results=$(grep -rliE "<script[^>]*src[^>]*($SCRIPT_REGEX)" $EXCLUDE --include="*.php" --include="*.html" --include="*.htm" "$SCAN_PATH" 2>/dev/null | head -50)
+
+if [ -n "$script_results" ]; then
+    echo "$script_results" | while read f; do
+        # Get matching script tags
+        script_tags=$(grep -oiE "<script[^>]*src[^>]*($SCRIPT_REGEX)[^>]*>" "$f" 2>/dev/null | head -3)
+        
+        # Extract URLs
+        script_urls=$(echo "$script_tags" | grep -oiE 'https?://[^"'"'"'\s>]+' | sort -u | tr '\n' ',' | sed 's/,$//')
+        
+        echo -e "${RED}[!] SUSPICIOUS${NC} $f (suspicious script src tag)"
+        echo -e "${CYN}    Script URLs: $script_urls${NC}"
+        echo -e "${YEL}    Tags found:${NC}"
+        echo "$script_tags" | while read tag; do
+            echo -e "${YEL}      $tag${NC}"
+        done
+        echo ""
+        found=1
+    done
+else
+    # Also search for hooks.js references in code
+    hooks_results=$(grep -rliE "(hooks\.js|hook\.js|w2ed\.icu)" $EXCLUDE --include="*.php" --include="*.js" --include="*.html" --include="*.htm" "$SCAN_PATH" 2>/dev/null | head -30)
+    if [ -n "$hooks_results" ]; then
+        echo "$hooks_results" | while read f; do
+            match_line=$(grep -iE "(hooks\.js|hook\.js|w2ed\.icu)" "$f" 2>/dev/null | head -1)
+            if [ -n "$match_line" ]; then
+                echo -e "${RED}[!] SUSPICIOUS${NC} $f (hooks.js or w2ed.icu reference)"
+                echo -e "${YEL}    Context: ${match_line:0:200}${NC}"
+                echo ""
+                found=1
+            fi
+        done
+    else
+        echo -e "${GRN}[~] No suspicious script tags found${NC}"
+    fi
+fi
+
 # External domain connections
 echo -e "${CYN}=== External Domain Connections ===${NC}"
 DOMAIN_REGEX=$(IFS='|'; echo "${EXTERNAL_DOMAINS[*]}")
@@ -555,6 +640,12 @@ if [ -n "$results" ]; then
         if echo "$context_line" | grep -qiE '(base64|atob|unescape|String\.fromCharCode|\\x[0-9a-f])'; then
             severity="${RED}[!]"
             reason=" (encoded/obfuscated domain)"
+        fi
+        
+        # Check for highly suspicious domains (.icu, .tk, .ml, .ga, .cf, w2ed.icu)
+        if echo "$domains_found" | grep -qiE '(w2ed\.icu|\.icu|\.tk|\.ml|\.ga|\.cf)'; then
+            severity="${RED}[!]"
+            reason=" (suspicious domain: .icu/.tk/.ml/.ga/.cf TLD)"
         fi
         
         echo -e "${severity}${NC} $f${reason}"
@@ -669,6 +760,23 @@ rm -f /tmp/decoded_$$ 2>/dev/null
 
 echo ""
 echo -e "${GRN}[*] Completed: $(date)${NC}"
+
+# Show scan statistics
+echo -e "${CYN}[*] Scan Statistics:${NC}"
+php_count=$(find "$SCAN_PATH" -type f -name "*.php" ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/vendor/*" ! -path "*/cache/*" 2>/dev/null | wc -l | tr -d ' ')
+js_count=$(find "$SCAN_PATH" -type f -name "*.js" ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/vendor/*" ! -path "*/cache/*" 2>/dev/null | wc -l | tr -d ' ')
+html_count=$(find "$SCAN_PATH" -type f \( -name "*.html" -o -name "*.htm" \) ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/vendor/*" ! -path "*/cache/*" 2>/dev/null | wc -l | tr -d ' ')
+total=$((php_count + js_count + html_count))
+echo -e "  Files scanned: ${total} (PHP: ${php_count}, JS: ${js_count}, HTML: ${html_count})"
+
+if [ "$found" -eq 0 ]; then
+    echo -e "${GRN}[*] No suspicious patterns found in scanned files${NC}"
+    echo -e "${YEL}[*] Note: Large minified libraries are automatically skipped to reduce false positives${NC}"
+else
+    echo -e "${YEL}[*] Review the findings above${NC}"
+fi
+
+echo ""
 echo -e "${YEL}[*] Tip: Use --deep for more thorough scan with decoding${NC}"
 echo -e "${CYN}[*] Legend:${NC}"
 echo -e "  ${RED}[!] SUSPICIOUS${NC} - High confidence backdoor detected"
