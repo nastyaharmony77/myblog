@@ -53,11 +53,63 @@ LEGITIMATE_JS_MARKERS=(
     "MIT license"
     "Copyright"
     "This file is auto-generated"
+    "underscore"
+    "Vue"
+    "select2"
+    "knockout"
+    "tinymce"
+    "mediaelement"
+    "plupload"
+    "moxie"
+    "twemoji"
+    "PhotoSwipe"
+    "DOMPurify"
+    "imagify"
+    "yaymail"
+    "all-in-one-wp-migration"
+    "elFinder"
+    "CodeMirror"
+    "coffeescript"
+)
+
+# Known library file patterns
+KNOWN_LIBRARY_PATTERNS=(
+    "underscore"
+    "vue"
+    "select2"
+    "selectWoo"
+    "jquery"
+    "knockout"
+    "tinymce"
+    "mediaelement"
+    "plupload"
+    "moxie"
+    "twemoji"
+    "photoswipe"
+    "dompurify"
+    "purify"
+    "imagify"
+    "yaymail"
+    "codemirror"
+    "elfinder"
+    "webgl"
+    "three"
+    "qr-code"
+    "cidr"
 )
 
 # Check if file is likely minified library
 is_likely_library() {
     local file="$1"
+    local filename=$(basename "$file")
+    
+    # Check filename patterns first (faster)
+    for pattern in "${KNOWN_LIBRARY_PATTERNS[@]}"; do
+        if echo "$filename" | grep -qiE "$pattern"; then
+            return 0  # Known library
+        fi
+    done
+    
     local size=$(wc -c < "$file" 2>/dev/null || echo 0)
     local lines=$(wc -l < "$file" 2>/dev/null || echo 0)
     local avg_line_len=$((size / (lines + 1)))
@@ -71,6 +123,14 @@ is_likely_library() {
             fi
         done
     fi
+    
+    # Check for common library patterns in content
+    if grep -qiE "(define\.amd|module\.exports|webpack|UMD|IIFE)" "$file" 2>/dev/null; then
+        if [ "$size" -gt 10000 ]; then
+            return 0  # Likely library
+        fi
+    fi
+    
     return 1
 }
 
@@ -422,15 +482,26 @@ find "$SCAN_PATH" -type f \( \
 \) 2>/dev/null | grep -v node_modules | grep -v vendor | head -50 | while read f; do
     # Check if it's hooks.js or similar suspicious JS
     if echo "$f" | grep -qiE '(hooks|hook|init|loader)\.js'; then
+        # Skip legitimate WordPress hooks.js files
+        if echo "$f" | grep -qiE '(wp-includes/js/dist/hooks\.js|wp-includes/js/hooks\.js)'; then
+            continue  # Legitimate WordPress file
+        fi
+        
+        # Skip if in known library locations
+        if is_wordpress_core "$f" || is_likely_library "$f"; then
+            continue
+        fi
+        
         echo -e "${RED}[!] SUSPICIOUS${NC} $f (suspicious JS filename)"
         # Check file content for suspicious patterns
         if grep -qiE '(eval|Function|WebSocket|atob|unescape|document\.write)' "$f" 2>/dev/null; then
             echo -e "${CYN}    Contains suspicious code patterns${NC}"
         fi
+        found=1
     else
         echo -e "${YEL}[?]${NC} $f"
+        found=1
     fi
-    found=1
 done
 
 # PHP in upload/image dirs
@@ -566,14 +637,24 @@ ws_results=$(grep -rliE "$WS_REGEX" $EXCLUDE --include="*.php" --include="*.js" 
 
 if [ -n "$ws_results" ]; then
     echo "$ws_results" | while read f; do
-        # Skip if likely a legitimate library (for JS files)
-        if [[ "$f" == *.js ]] && is_likely_library "$f"; then
+        # Skip if likely a legitimate library (for all files)
+        if is_likely_library "$f"; then
+            continue
+        fi
+        
+        # Skip WordPress core files
+        if is_wordpress_core "$f"; then
             continue
         fi
         
         # Get matching patterns
         match_line=$(grep -iE "$WS_REGEX" "$f" 2>/dev/null | head -1)
         if [ -z "$match_line" ]; then
+            continue
+        fi
+        
+        # Skip if it's just a comment in PHP (translators, comments, etc.)
+        if [[ "$f" == *.php ]] && echo "$match_line" | grep -qiE '(translators|comment|//|/\*|new function name|introduced new function)'; then
             continue
         fi
         
@@ -612,8 +693,12 @@ if [ -n "$ws_results" ]; then
         
         # Check for new Function
         if echo "$match_line" | grep -qiE 'new\s+Function'; then
-            # Skip WordPress core and known libraries
+            # Skip WordPress core, known libraries, and PHP comments
             if is_wordpress_core "$f" || is_likely_library "$f"; then
+                continue
+            fi
+            # Skip if it's just a comment in PHP
+            if [[ "$f" == *.php ]] && echo "$match_line" | grep -qiE '(translators|comment|//|/\*)'; then
                 continue
             fi
             reason=" (dynamic Function() constructor)"
@@ -695,13 +780,24 @@ if [ -n "$hooks_results" ]; then
             echo ""
             found=1
         else
-            # If not in script tag, still report it
+            # If not in script tag, check if it's a false positive
             match_line=$(echo "$match_lines" | head -1)
             if [ -n "$match_line" ]; then
-                echo -e "${RED}[!] SUSPICIOUS${NC} $f (w2ed.icu or hooks.js reference found)"
-                echo -e "${YEL}    Context: ${match_line:0:200}${NC}"
-                echo ""
-                found=1
+                # Skip if it's just "wp-hooks" or "hooks" in array/string (not a real hook)
+                if echo "$match_line" | grep -qiE "('wp-hooks'|\"wp-hooks\"|array.*hooks|hooks.*array|'hooks\.js'|\"hooks\.js\"|script-loader-packages)"; then
+                    continue  # False positive - just array key or string
+                fi
+                # Skip if it's in a PHP array/package list (not a real script tag)
+                if [[ "$f" == *.php ]] && echo "$match_line" | grep -qiE "(array\(|=>|return array|script-loader-packages|wp-includes/assets)"; then
+                    continue  # False positive - PHP array definition
+                fi
+                # Only report if it's actually w2ed.icu or suspicious hooks.js reference
+                if echo "$match_line" | grep -qiE "(w2ed\.icu|https?://.*hooks\.js|/js/hooks)"; then
+                    echo -e "${RED}[!] SUSPICIOUS${NC} $f (w2ed.icu or hooks.js reference found)"
+                    echo -e "${YEL}    Context: ${match_line:0:200}${NC}"
+                    echo ""
+                    found=1
+                fi
             fi
         fi
     done
@@ -765,22 +861,24 @@ if [ -n "$results" ]; then
             continue
         fi
         
-        # Get all matching domains in this file (only real domains, not variable parts)
-        # Filter out false positives - domains should be in URL context
-        domains_found=$(grep -oiE "$DOMAIN_REGEX" "$f" 2>/dev/null | grep -iE '(https?://|//|www\.|\.com|\.net|\.org|\.icu|\.tk|\.ml|\.ga|\.cf)' | sort -u | tr '\n' ',' | sed 's/,$//')
+        # Get all matching domains in this file (only real domains with protocol, not variable parts)
+        # First, find lines with real URLs
+        url_lines=$(grep -iE "(https?://[^\"'\\s<>]+\.(icu|tk|ml|ga|cf)|https?://[^\"'\\s<>]+(googleapis|googlesyndication|googletagmanager|google-analytics|doubleclick|facebook|yandex|cdn\.jsdelivr|cdnjs\.cloudflare))" "$f" 2>/dev/null)
         
-        # Skip if no real domains found (just variable parts)
+        if [ -z "$url_lines" ]; then
+            continue  # No real URLs found
+        fi
+        
+        # Extract real domains from URLs only
+        domains_found=$(echo "$url_lines" | grep -oiE 'https?://([^/"]+\.(icu|tk|ml|ga|cf|com|net|org|ru))' | sed 's|https\?://||' | cut -d'/' -f1 | sort -u | tr '\n' ',' | sed 's/,$//')
+        
+        # Skip if no real domains found
         if [ -z "$domains_found" ]; then
             continue
         fi
         
-        # Get context line (only with URL indicators)
-        context_line=$(grep -iE "$DOMAIN_REGEX" "$f" 2>/dev/null | grep -iE '(https?://|//|www\.)' | head -1)
-        
-        # Skip if context doesn't contain URL (likely false positive from variable names)
-        if [ -z "$context_line" ] || ! echo "$context_line" | grep -qiE '(https?://|//|www\.|\.com|\.net|\.org)'; then
-            continue
-        fi
+        # Get context line (only with real URLs)
+        context_line=$(echo "$url_lines" | head -1)
         
         # Determine severity based on file location and type
         severity="${YEL}[?]"
@@ -810,14 +908,24 @@ if [ -n "$results" ]; then
             reason=" (encoded/obfuscated domain)"
         fi
         
-        # Check for highly suspicious domains (.icu, .tk, .ml, .ga, .cf) - but only if in URL
-        if echo "$domains_found" | grep -qiE '(w2ed\.icu|https?://[^/]+\.icu|//[^/]+\.icu|https?://[^/]+\.tk|//[^/]+\.tk|https?://[^/]+\.ml|//[^/]+\.ml|https?://[^/]+\.ga|//[^/]+\.ga|https?://[^/]+\.cf|//[^/]+\.cf)'; then
-            severity="${RED}[!]"
-            reason=" (suspicious domain: .icu/.tk/.ml/.ga/.cf TLD)"
+        # Check for highly suspicious domains (.icu, .tk, .ml, .ga, .cf) - but only if in real URL
+        # Only flag if domain is in actual URL (with protocol), not variable parts
+        if echo "$context_line" | grep -qiE 'https?://[^/"]+\.(icu|tk|ml|ga|cf)'; then
+            # Extract the actual domain from URL
+            url_domain=$(echo "$context_line" | grep -oiE 'https?://([^/"]+\.(icu|tk|ml|ga|cf))' | sed 's|https\?://||' | head -1)
+            if [ -n "$url_domain" ] && ! echo "$url_domain" | grep -qiE '^(media|settings|options|nonces|image|color|bitArray|Touch|controller|library|this|e|i|n|t|r|s|a|Ga|ga|gA|mL|mejs|flickr|antix|dolby|openblox|avm99963|stefano)\.'; then
+                severity="${RED}[!]"
+                reason=" (suspicious domain: .icu/.tk/.ml/.ga/.cf TLD in URL)"
+            fi
         fi
         
-        # Skip WordPress core false positives (unless highly suspicious)
-        if is_wordpress_core "$f" && [ "$severity" != "${RED}[!]" ]; then
+        # Skip WordPress core false positives (unless highly suspicious like w2ed.icu)
+        if is_wordpress_core "$f" && [ "$severity" != "${RED}[!]" ] && ! echo "$domains_found" | grep -qiE 'w2ed\.icu'; then
+            continue
+        fi
+        
+        # Skip known libraries (unless highly suspicious)
+        if is_likely_library "$f" && [ "$severity" != "${RED}[!]" ] && ! echo "$domains_found" | grep -qiE 'w2ed\.icu'; then
             continue
         fi
         
