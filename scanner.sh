@@ -183,6 +183,12 @@ JS_PATTERNS=(
     'document\.write\s*\(\s*unescape'
     'String\.fromCharCode.*String\.fromCharCode.*String\.fromCharCode'
     'eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k'
+    'new\s+WebSocket'
+    'new\s+Function'
+    'ilb\s*='
+    'WebSocket\s*\('
+    'ws://'
+    'wss://'
 )
 
 # External domain connections to search for
@@ -366,20 +372,143 @@ if [ -n "$results" ]; then
             fi
         fi
         
+        # Check for new WebSocket (suspicious - can be used for C2)
+        if echo "$match_line" | grep -qiE 'new\s+WebSocket|WebSocket\s*\('; then
+            suspicious=true
+        fi
+        
+        # Check for new Function (dynamic code execution)
+        if echo "$match_line" | grep -qiE 'new\s+Function'; then
+            suspicious=true
+        fi
+        
+        # Check for ilb= (suspicious variable pattern)
+        if echo "$match_line" | grep -qiE 'ilb\s*='; then
+            suspicious=true
+        fi
+        
+        # Check for WebSocket URLs (ws:// or wss://)
+        if echo "$match_line" | grep -qiE 'ws://|wss://'; then
+            # Extract URL if present
+            ws_url=$(echo "$match_line" | grep -oiE '(ws|wss)://[^\s"'"'"']+' | head -1)
+            if [ -n "$ws_url" ]; then
+                suspicious=true
+            fi
+        fi
+        
+        # Get file info (date, size)
+        file_info=""
+        if command -v stat >/dev/null 2>&1; then
+            if stat -c "%y %s" "$f" >/dev/null 2>&1; then
+                # Linux stat
+                file_date=$(stat -c "%y" "$f" 2>/dev/null | cut -d'.' -f1)
+                file_size=$(stat -c "%s" "$f" 2>/dev/null)
+                file_info=" (${file_date}, ${file_size} bytes)"
+            elif stat -f "%Sm %z" "$f" >/dev/null 2>&1; then
+                # macOS stat
+                file_date=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$f" 2>/dev/null)
+                file_size=$(stat -f "%z" "$f" 2>/dev/null)
+                file_info=" (${file_date}, ${file_size} bytes)"
+            fi
+        fi
+        
         if [ "$suspicious" = true ]; then
-            echo -e "${RED}[!] SUSPICIOUS${NC} $f"
+            echo -e "${RED}[!] SUSPICIOUS${NC} $f${file_info}"
             echo -e "${YEL}    Pattern: ${match_line:0:150}${NC}"
             if [ -n "$decoded" ]; then
                 echo -e "${CYN}    Decoded: ${decoded:0:200}...${NC}"
             fi
+            if [ -n "$ws_url" ]; then
+                echo -e "${CYN}    WebSocket URL: $ws_url${NC}"
+            fi
             echo ""
             found=1
         else
-            echo -e "${YEL}[?] Check${NC} $f (pattern found but context unclear)"
+            echo -e "${YEL}[?] Check${NC} $f${file_info} (pattern found but context unclear)"
             echo -e "${YEL}    Pattern: ${match_line:0:100}${NC}"
             echo ""
         fi
     done
+fi
+
+# WebSocket, Function, and suspicious variable patterns (all file types)
+echo -e "${RED}=== WebSocket/Function/ilb Patterns (All Files) ===${NC}"
+WS_PATTERNS=('new\s+WebSocket' 'new\s+Function' 'ilb\s*=')
+WS_REGEX=$(IFS='|'; echo "${WS_PATTERNS[*]}")
+ws_results=$(grep -rliE "$WS_REGEX" $EXCLUDE --include="*.php" --include="*.js" --include="*.html" --include="*.htm" "$SCAN_PATH" 2>/dev/null | head -100)
+
+if [ -n "$ws_results" ]; then
+    echo "$ws_results" | while read f; do
+        # Skip if likely a legitimate library (for JS files)
+        if [[ "$f" == *.js ]] && is_likely_library "$f"; then
+            continue
+        fi
+        
+        # Get matching patterns
+        match_line=$(grep -iE "$WS_REGEX" "$f" 2>/dev/null | head -1)
+        if [ -z "$match_line" ]; then
+            continue
+        fi
+        
+        # Get all matching patterns in file
+        patterns_found=$(grep -oiE "$WS_REGEX" "$f" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+        
+        # Get file info (date, size, name) - like in user's example
+        file_info=""
+        if command -v stat >/dev/null 2>&1; then
+            if stat -c "%y %s %n" "$f" >/dev/null 2>&1; then
+                # Linux stat
+                file_date=$(stat -c "%y" "$f" 2>/dev/null | cut -d'.' -f1)
+                file_size=$(stat -c "%s" "$f" 2>/dev/null)
+                file_info=" (${file_date}, ${file_size} bytes)"
+            elif stat -f "%Sm %z %N" "$f" >/dev/null 2>&1; then
+                # macOS stat
+                file_date=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$f" 2>/dev/null)
+                file_size=$(stat -f "%z" "$f" 2>/dev/null)
+                file_info=" (${file_date}, ${file_size} bytes)"
+            fi
+        fi
+        
+        # Determine severity
+        severity="${RED}[!]"
+        reason=""
+        
+        # Check for WebSocket
+        if echo "$match_line" | grep -qiE 'new\s+WebSocket|WebSocket\s*\('; then
+            ws_url=$(echo "$match_line" | grep -oiE '(ws|wss)://[^\s"'"'"']+' | head -1)
+            if [ -n "$ws_url" ]; then
+                reason=" (WebSocket connection found)"
+            else
+                reason=" (WebSocket constructor found)"
+            fi
+        fi
+        
+        # Check for new Function
+        if echo "$match_line" | grep -qiE 'new\s+Function'; then
+            reason=" (dynamic Function() constructor)"
+        fi
+        
+        # Check for ilb=
+        if echo "$match_line" | grep -qiE 'ilb\s*='; then
+            reason=" (suspicious variable pattern)"
+        fi
+        
+        # Check if in suspicious location
+        if echo "$f" | grep -qiE '(upload|tmp|temp|cache|wp-content/uploads)'; then
+            reason="${reason} (in upload/temp directory)"
+        fi
+        
+        echo -e "${severity}${NC} $f${file_info}${reason}"
+        echo -e "${CYN}    Patterns: $patterns_found${NC}"
+        echo -e "${YEL}    Context: ${match_line:0:150}${NC}"
+        if [ -n "$ws_url" ]; then
+            echo -e "${CYN}    WebSocket URL: $ws_url${NC}"
+        fi
+        echo ""
+        found=1
+    done
+else
+    echo -e "${GRN}[~] No WebSocket/Function/ilb patterns found${NC}"
 fi
 
 # External domain connections
