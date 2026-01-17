@@ -13,6 +13,28 @@ DEEP_SCAN="${2:-}"
 
 echo -e "${YEL}[*] Scanning: $SCAN_PATH${NC}"
 echo -e "${YEL}[*] Started: $(date)${NC}"
+
+# Diagnostic: Check if path exists and show file count
+if [ ! -d "$SCAN_PATH" ] && [ ! -f "$SCAN_PATH" ]; then
+    echo -e "${RED}[!] ERROR: Path does not exist: $SCAN_PATH${NC}"
+    exit 1
+fi
+
+# Show quick file count for diagnostics
+php_count=$(find "$SCAN_PATH" -type f -name "*.php" ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/vendor/*" ! -path "*/cache/*" 2>/dev/null | wc -l | tr -d ' ')
+js_count=$(find "$SCAN_PATH" -type f -name "*.js" ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/vendor/*" ! -path "*/cache/*" 2>/dev/null | wc -l | tr -d ' ')
+html_count=$(find "$SCAN_PATH" -type f \( -name "*.html" -o -name "*.htm" \) ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/vendor/*" ! -path "*/cache/*" 2>/dev/null | wc -l | tr -d ' ')
+
+if [ "$php_count" -eq 0 ] && [ "$js_count" -eq 0 ] && [ "$html_count" -eq 0 ]; then
+    echo -e "${YEL}[!] WARNING: No PHP/JS/HTML files found in: $SCAN_PATH${NC}"
+    echo -e "${YEL}[*] Checking if path is correct...${NC}"
+    if [ -d "$SCAN_PATH" ]; then
+        echo -e "${CYN}[*] Directory exists. Listing first 5 files:${NC}"
+        find "$SCAN_PATH" -maxdepth 2 -type f 2>/dev/null | head -5
+    fi
+    echo ""
+fi
+
 echo ""
 
 # Exclude dirs for speed
@@ -49,6 +71,57 @@ is_likely_library() {
             fi
         done
     fi
+    return 1
+}
+
+# Check if file is WordPress core file (to reduce false positives)
+is_wordpress_core() {
+    local file="$1"
+    # WordPress core paths
+    if echo "$file" | grep -qiE "(wp-includes|wp-admin|wp-content/themes/twenty|wp-settings\.php|wp-config\.php)"; then
+        return 0
+    fi
+    # Known WordPress plugin paths (common legitimate plugins)
+    if echo "$file" | grep -qiE "(wp-content/plugins/(wordfence|woocommerce|yoast|advanced-custom-fields|contact-form-7|wp-mail-smtp|imagify|all-in-one-wp-migration)/)"; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if pattern is false positive for WordPress
+is_wordpress_false_positive() {
+    local file="$1"
+    local pattern="$2"
+    local context="$3"
+    
+    # fsockopen is normal in WordPress
+    if echo "$pattern" | grep -qiE "fsockopen"; then
+        if is_wordpress_core "$file"; then
+            return 0  # False positive
+        fi
+    fi
+    
+    # preg_replace is normal in WordPress
+    if echo "$pattern" | grep -qiE "preg_replace"; then
+        if is_wordpress_core "$file"; then
+            return 0  # False positive
+        fi
+    fi
+    
+    # new Function in known libraries
+    if echo "$pattern" | grep -qiE "new\s+Function|new\s+function"; then
+        if is_likely_library "$file" || is_wordpress_core "$file"; then
+            return 0  # False positive
+        fi
+    fi
+    
+    # chr() concatenation is normal in WordPress
+    if echo "$pattern" | grep -qiE "chr\s*\("; then
+        if is_wordpress_core "$file"; then
+            return 0  # False positive
+        fi
+    fi
+    
     return 1
 }
 
@@ -217,11 +290,17 @@ EXTERNAL_DOMAINS=(
     'fonts\.googleapis\.com'
     'apis\.google\.com'
     'w2ed\.icu'
-    '[a-z0-9-]+\.icu'
-    '[a-z0-9-]+\.tk'
-    '[a-z0-9-]+\.ml'
-    '[a-z0-9-]+\.ga'
-    '[a-z0-9-]+\.cf'
+    # Only match real domains, not variable parts (require http/https or //)
+    'https?://[a-z0-9-]+\.icu'
+    '//[a-z0-9-]+\.icu'
+    'https?://[a-z0-9-]+\.tk'
+    '//[a-z0-9-]+\.tk'
+    'https?://[a-z0-9-]+\.ml'
+    '//[a-z0-9-]+\.ml'
+    'https?://[a-z0-9-]+\.ga'
+    '//[a-z0-9-]+\.ga'
+    'https?://[a-z0-9-]+\.cf'
+    '//[a-z0-9-]+\.cf'
 )
 
 # Suspicious file names to search for
@@ -275,6 +354,12 @@ if [ -n "$results" ]; then
             suspicious=true
         fi
         
+        # Check for WordPress false positives
+        if is_wordpress_false_positive "$f" "$match_line" "$match_line"; then
+            # Skip WordPress core false positives
+            continue
+        fi
+        
         if [ "$suspicious" = true ]; then
             echo -e "${RED}[!] SUSPICIOUS${NC} $f"
             echo -e "${YEL}    Pattern: ${match_line:0:150}${NC}"
@@ -284,9 +369,12 @@ if [ -n "$results" ]; then
             echo ""
             found=1
         else
-            echo -e "${YEL}[?] Check${NC} $f (pattern found but may be false positive)"
-            echo -e "${YEL}    Pattern: ${match_line:0:100}${NC}"
-            echo ""
+            # Only show if not WordPress core
+            if ! is_wordpress_core "$f"; then
+                echo -e "${YEL}[?] Check${NC} $f (pattern found but may be false positive)"
+                echo -e "${YEL}    Pattern: ${match_line:0:100}${NC}"
+                echo ""
+            fi
         fi
         rm -f "$tmp_file" 2>/dev/null
     done
@@ -415,7 +503,10 @@ if [ -n "$results" ]; then
         
         # Check for new Function (dynamic code execution)
         if echo "$match_line" | grep -qiE 'new\s+Function'; then
-            suspicious=true
+            # Skip if WordPress core or known library
+            if ! is_wordpress_core "$f" && ! is_likely_library "$f"; then
+                suspicious=true
+            fi
         fi
         
         # Check for ilb= (suspicious variable pattern)
@@ -521,6 +612,10 @@ if [ -n "$ws_results" ]; then
         
         # Check for new Function
         if echo "$match_line" | grep -qiE 'new\s+Function'; then
+            # Skip WordPress core and known libraries
+            if is_wordpress_core "$f" || is_likely_library "$f"; then
+                continue
+            fi
             reason=" (dynamic Function() constructor)"
         fi
         
@@ -551,7 +646,24 @@ fi
 echo -e "${RED}=== Suspicious Script Tags (script src) ===${NC}"
 
 # First, search for w2ed.icu and hooks.js anywhere in files (broader search)
-hooks_results=$(grep -rliE "(w2ed\.icu|hooks\.js|w2ed|/js/hooks)" $EXCLUDE --include="*.php" --include="*.js" --include="*.html" --include="*.htm" --include="*.txt" --include="*.tpl" --include="*.inc" "$SCAN_PATH" 2>/dev/null | head -100)
+# Try multiple methods for better compatibility
+hooks_results=""
+# Method 1: Use grep -r (faster if it works)
+if grep -rliE "(w2ed\.icu|hooks\.js|w2ed|/js/hooks)" $EXCLUDE --include="*.php" --include="*.js" --include="*.html" --include="*.htm" --include="*.txt" --include="*.tpl" --include="*.inc" "$SCAN_PATH" 2>/dev/null | head -100 > /tmp/hooks_$$ 2>/dev/null; then
+    hooks_results=$(cat /tmp/hooks_$$ 2>/dev/null)
+    rm -f /tmp/hooks_$$ 2>/dev/null
+fi
+
+# Method 2: Fallback to find + grep if method 1 found nothing
+if [ -z "$hooks_results" ]; then
+    find "$SCAN_PATH" -type f \( -name "*.php" -o -name "*.js" -o -name "*.html" -o -name "*.htm" -o -name "*.txt" -o -name "*.tpl" -o -name "*.inc" \) ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/vendor/*" ! -path "*/cache/*" ! -path "*/dist/*" ! -path "*/build/*" 2>/dev/null | while read f; do
+        if grep -qiE "(w2ed\.icu|hooks\.js|w2ed|/js/hooks)" "$f" 2>/dev/null; then
+            echo "$f"
+        fi
+    done | head -100 > /tmp/hooks_$$ 2>/dev/null
+    hooks_results=$(cat /tmp/hooks_$$ 2>/dev/null)
+    rm -f /tmp/hooks_$$ 2>/dev/null
+fi
 
 if [ -n "$hooks_results" ]; then
     echo "$hooks_results" | while read f; do
@@ -653,11 +765,22 @@ if [ -n "$results" ]; then
             continue
         fi
         
-        # Get all matching domains in this file
-        domains_found=$(grep -oiE "$DOMAIN_REGEX" "$f" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+        # Get all matching domains in this file (only real domains, not variable parts)
+        # Filter out false positives - domains should be in URL context
+        domains_found=$(grep -oiE "$DOMAIN_REGEX" "$f" 2>/dev/null | grep -iE '(https?://|//|www\.|\.com|\.net|\.org|\.icu|\.tk|\.ml|\.ga|\.cf)' | sort -u | tr '\n' ',' | sed 's/,$//')
         
-        # Get context line
-        context_line=$(grep -iE "$DOMAIN_REGEX" "$f" 2>/dev/null | head -1)
+        # Skip if no real domains found (just variable parts)
+        if [ -z "$domains_found" ]; then
+            continue
+        fi
+        
+        # Get context line (only with URL indicators)
+        context_line=$(grep -iE "$DOMAIN_REGEX" "$f" 2>/dev/null | grep -iE '(https?://|//|www\.)' | head -1)
+        
+        # Skip if context doesn't contain URL (likely false positive from variable names)
+        if [ -z "$context_line" ] || ! echo "$context_line" | grep -qiE '(https?://|//|www\.|\.com|\.net|\.org)'; then
+            continue
+        fi
         
         # Determine severity based on file location and type
         severity="${YEL}[?]"
@@ -687,10 +810,15 @@ if [ -n "$results" ]; then
             reason=" (encoded/obfuscated domain)"
         fi
         
-        # Check for highly suspicious domains (.icu, .tk, .ml, .ga, .cf, w2ed.icu)
-        if echo "$domains_found" | grep -qiE '(w2ed\.icu|\.icu|\.tk|\.ml|\.ga|\.cf)'; then
+        # Check for highly suspicious domains (.icu, .tk, .ml, .ga, .cf) - but only if in URL
+        if echo "$domains_found" | grep -qiE '(w2ed\.icu|https?://[^/]+\.icu|//[^/]+\.icu|https?://[^/]+\.tk|//[^/]+\.tk|https?://[^/]+\.ml|//[^/]+\.ml|https?://[^/]+\.ga|//[^/]+\.ga|https?://[^/]+\.cf|//[^/]+\.cf)'; then
             severity="${RED}[!]"
             reason=" (suspicious domain: .icu/.tk/.ml/.ga/.cf TLD)"
+        fi
+        
+        # Skip WordPress core false positives (unless highly suspicious)
+        if is_wordpress_core "$f" && [ "$severity" != "${RED}[!]" ]; then
+            continue
         fi
         
         echo -e "${severity}${NC} $f${reason}"
