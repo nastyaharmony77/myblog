@@ -96,6 +96,16 @@ KNOWN_LIBRARY_PATTERNS=(
     "three"
     "qr-code"
     "cidr"
+    "jquery-payment"
+    "beat"
+    "coffeescript"
+    "fakejshint"
+    "colorpicker"
+    "heartbeat"
+    "wp-emoji"
+    "wp-api"
+    "wp-mediaelement"
+    "jquery\.query"
 )
 
 # Check if file is likely minified library
@@ -128,6 +138,21 @@ is_likely_library() {
     if grep -qiE "(define\.amd|module\.exports|webpack|UMD|IIFE)" "$file" 2>/dev/null; then
         if [ "$size" -gt 10000 ]; then
             return 0  # Likely library
+        fi
+    fi
+    
+    # Check for minified file patterns (common in libraries)
+    if [ "$size" -gt 50000 ] && [ "$avg_line_len" -gt 200 ]; then
+        # Large minified files are usually libraries
+        if echo "$filename" | grep -qiE "\.min\.(js|css)"; then
+            return 0  # Minified library file
+        fi
+    fi
+    
+    # Check for specific library content markers
+    if grep -qiE "(jQuery|Backbone|Underscore|Vue|React|Angular|Ember|Mootools|Prototype|Dojo|YUI|ExtJS)" "$file" 2>/dev/null; then
+        if [ "$size" -gt 5000 ]; then
+            return 0  # Known framework/library
         fi
     fi
     
@@ -610,6 +635,12 @@ if [ -n "$results" ]; then
             fi
         fi
         
+        # Double-check if it's a known library (even if first check missed it)
+        if is_likely_library "$f" || is_wordpress_core "$f"; then
+            # Skip known libraries even if pattern found
+            continue
+        fi
+        
         if [ "$suspicious" = true ]; then
             echo -e "${RED}[!] SUSPICIOUS${NC} $f${file_info}"
             echo -e "${YEL}    Pattern: ${match_line:0:150}${NC}"
@@ -622,9 +653,12 @@ if [ -n "$results" ]; then
             echo ""
             found=1
         else
-            echo -e "${YEL}[?] Check${NC} $f${file_info} (pattern found but context unclear)"
-            echo -e "${YEL}    Pattern: ${match_line:0:100}${NC}"
-            echo ""
+            # Only show if not WordPress core
+            if ! is_wordpress_core "$f"; then
+                echo -e "${YEL}[?] Check${NC} $f${file_info} (pattern found but context unclear)"
+                echo -e "${YEL}    Pattern: ${match_line:0:100}${NC}"
+                echo ""
+            fi
         fi
     done
 fi
@@ -698,8 +732,12 @@ if [ -n "$ws_results" ]; then
                 continue
             fi
             # Skip if it's just a comment in PHP
-            if [[ "$f" == *.php ]] && echo "$match_line" | grep -qiE '(translators|comment|//|/\*)'; then
+            if [[ "$f" == *.php ]] && echo "$match_line" | grep -qiE '(translators|comment|//|/\*|introduced new function|new function name)'; then
                 continue
+            fi
+            # Skip CodeMirror example files (index.html)
+            if echo "$f" | grep -qiE "(codemirror.*index\.html|mode/.*index\.html)"; then
+                continue  # Example files, not backdoors
             fi
             reason=" (dynamic Function() constructor)"
         fi
@@ -784,12 +822,16 @@ if [ -n "$hooks_results" ]; then
             match_line=$(echo "$match_lines" | head -1)
             if [ -n "$match_line" ]; then
                 # Skip if it's just "wp-hooks" or "hooks" in array/string (not a real hook)
-                if echo "$match_line" | grep -qiE "('wp-hooks'|\"wp-hooks\"|array.*hooks|hooks.*array|'hooks\.js'|\"hooks\.js\"|script-loader-packages)"; then
+                if echo "$match_line" | grep -qiE "('wp-hooks'|\"wp-hooks\"|array.*hooks|hooks.*array|'hooks\.js'|\"hooks\.js\"|script-loader-packages|wp-includes/assets)"; then
                     continue  # False positive - just array key or string
                 fi
                 # Skip if it's in a PHP array/package list (not a real script tag)
-                if [[ "$f" == *.php ]] && echo "$match_line" | grep -qiE "(array\(|=>|return array|script-loader-packages|wp-includes/assets)"; then
+                if [[ "$f" == *.php ]] && echo "$match_line" | grep -qiE "(array\(|=>|return array|script-loader-packages|wp-includes/assets|'dependencies'.*wp-hooks)"; then
                     continue  # False positive - PHP array definition
+                fi
+                # Skip if file is script-loader-packages.php (known WordPress file)
+                if echo "$f" | grep -qiE "script-loader-packages\.php"; then
+                    continue  # Known WordPress file
                 fi
                 # Only report if it's actually w2ed.icu or suspicious hooks.js reference
                 if echo "$match_line" | grep -qiE "(w2ed\.icu|https?://.*hooks\.js|/js/hooks)"; then
@@ -869,6 +911,13 @@ if [ -n "$results" ]; then
             continue  # No real URLs found
         fi
         
+        # Filter out false positives - skip if URL is in comment or part of longer domain
+        url_lines=$(echo "$url_lines" | grep -vE '(//.*galapad|/\*.*galapad|github\.com.*\.ga|\.net.*\.ga|\.org.*\.ga|\.com.*\.ga)')
+        
+        if [ -z "$url_lines" ]; then
+            continue  # All URLs were false positives
+        fi
+        
         # Extract real domains from URLs only
         domains_found=$(echo "$url_lines" | grep -oiE 'https?://([^/"]+\.(icu|tk|ml|ga|cf|com|net|org|ru))' | sed 's|https\?://||' | cut -d'/' -f1 | sort -u | tr '\n' ',' | sed 's/,$//')
         
@@ -904,18 +953,39 @@ if [ -n "$results" ]; then
         
         # Check if domain is in encoded form (suspicious)
         if echo "$context_line" | grep -qiE '(base64|atob|unescape|String\.fromCharCode|\\x[0-9a-f])'; then
+            # Skip if it's a known legitimate CDN (not really obfuscated)
+            if echo "$domains_found" | grep -qiE '(cdn\.jsdelivr\.net|cdnjs\.cloudflare\.com|fonts\.googleapis\.com|ajax\.googleapis\.com|gstatic\.com)'; then
+                if is_wordpress_core "$f" || is_likely_library "$f"; then
+                    continue  # Known legitimate CDN, not obfuscated
+                fi
+            fi
             severity="${RED}[!]"
             reason=" (encoded/obfuscated domain)"
         fi
         
         # Check for highly suspicious domains (.icu, .tk, .ml, .ga, .cf) - but only if in real URL
-        # Only flag if domain is in actual URL (with protocol), not variable parts
+        # Only flag if domain is in actual URL (with protocol), not variable parts or comments
         if echo "$context_line" | grep -qiE 'https?://[^/"]+\.(icu|tk|ml|ga|cf)'; then
+            # Skip if it's in a comment (// or /*) or part of longer URL
+            if echo "$context_line" | grep -qiE '(//.*galapad|/\*.*galapad|github\.com|\.net|\.org|\.com)'; then
+                continue  # False positive - comment or part of longer URL (like galapad.net)
+            fi
             # Extract the actual domain from URL
             url_domain=$(echo "$context_line" | grep -oiE 'https?://([^/"]+\.(icu|tk|ml|ga|cf))' | sed 's|https\?://||' | head -1)
-            if [ -n "$url_domain" ] && ! echo "$url_domain" | grep -qiE '^(media|settings|options|nonces|image|color|bitArray|Touch|controller|library|this|e|i|n|t|r|s|a|Ga|ga|gA|mL|mejs|flickr|antix|dolby|openblox|avm99963|stefano)\.'; then
+            # Skip if domain is part of a longer domain (like www.ga in galapad.net)
+            if echo "$context_line" | grep -qiE '(galapad|github|\.net|\.org|\.com)'; then
+                continue  # Part of longer domain
+            fi
+            if [ -n "$url_domain" ] && ! echo "$url_domain" | grep -qiE '^(media|settings|options|nonces|image|color|bitArray|Touch|controller|library|this|e|i|n|t|r|s|a|Ga|ga|gA|mL|mejs|flickr|antix|dolby|openblox|avm99963|stefano|www\.ga|galapad)\.'; then
                 severity="${RED}[!]"
                 reason=" (suspicious domain: .icu/.tk/.ml/.ga/.cf TLD in URL)"
+            fi
+        fi
+        
+        # Skip known legitimate CDNs (unless highly suspicious)
+        if echo "$domains_found" | grep -qiE '(cdn\.jsdelivr\.net|cdnjs\.cloudflare\.com|fonts\.googleapis\.com|ajax\.googleapis\.com|gstatic\.com)' && [ "$severity" != "${RED}[!]" ]; then
+            if is_wordpress_core "$f" || is_likely_library "$f"; then
+                continue  # Known legitimate CDN in WordPress/library
             fi
         fi
         
