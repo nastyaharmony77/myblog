@@ -549,51 +549,96 @@ fi
 
 # Suspicious script src tags (like hooks.js from w2ed.icu)
 echo -e "${RED}=== Suspicious Script Tags (script src) ===${NC}"
+
+# First, search for w2ed.icu and hooks.js anywhere in files (broader search)
+hooks_results=$(grep -rliE "(w2ed\.icu|hooks\.js|w2ed|/js/hooks)" $EXCLUDE --include="*.php" --include="*.js" --include="*.html" --include="*.htm" --include="*.txt" --include="*.tpl" --include="*.inc" "$SCAN_PATH" 2>/dev/null | head -100)
+
+if [ -n "$hooks_results" ]; then
+    echo "$hooks_results" | while read f; do
+        # Get all matching lines
+        match_lines=$(grep -iE "(w2ed\.icu|hooks\.js)" "$f" 2>/dev/null)
+        
+        # Check if any line contains script tag
+        script_match=$(echo "$match_lines" | grep -iE "<script[^>]*src" | head -1)
+        
+        if [ -n "$script_match" ]; then
+            # Extract script tag
+            script_tag=$(echo "$script_match" | grep -oiE "<script[^>]*>.*?</script>|<script[^>]*>" | head -1)
+            # Extract URL from src attribute (better pattern)
+            script_url=$(echo "$script_match" | grep -oiE 'src\s*=\s*["'"'"']([^"'"'"']+)["'"'"']' | sed -E "s/.*src\s*=\s*['\"]([^'\"]+)['\"].*/\1/" | head -1)
+            # Fallback if above doesn't work
+            if [ -z "$script_url" ] || [ "$script_url" = "$script_match" ]; then
+                script_url=$(echo "$script_match" | grep -oiE 'https?://[^"'"'"'\s<>"]+' | head -1)
+            fi
+            
+            echo -e "${RED}[!] SUSPICIOUS${NC} $f (suspicious script src tag)"
+            if [ -n "$script_url" ]; then
+                echo -e "${CYN}    Script URL: $script_url${NC}"
+            fi
+            if [ -n "$script_tag" ]; then
+                echo -e "${YEL}    Script tag: ${script_tag:0:200}${NC}"
+            else
+                echo -e "${YEL}    Context: ${script_match:0:200}${NC}"
+            fi
+            echo ""
+            found=1
+        else
+            # If not in script tag, still report it
+            match_line=$(echo "$match_lines" | head -1)
+            if [ -n "$match_line" ]; then
+                echo -e "${RED}[!] SUSPICIOUS${NC} $f (w2ed.icu or hooks.js reference found)"
+                echo -e "${YEL}    Context: ${match_line:0:200}${NC}"
+                echo ""
+                found=1
+            fi
+        fi
+    done
+fi
+
+# Also search for script tags with suspicious domains
 SUSPICIOUS_SCRIPT_PATTERNS=(
     'w2ed\.icu'
     'hooks\.js'
-    'script.*src.*\.icu'
-    'script.*src.*\.tk'
-    'script.*src.*\.ml'
-    'script.*src.*\.ga'
-    'script.*src.*\.cf'
+    '\.icu/js'
+    '\.tk/js'
+    '\.ml/js'
+    '\.ga/js'
+    '\.cf/js'
 )
 SCRIPT_REGEX=$(IFS='|'; echo "${SUSPICIOUS_SCRIPT_PATTERNS[*]}")
-script_results=$(grep -rliE "<script[^>]*src[^>]*($SCRIPT_REGEX)" $EXCLUDE --include="*.php" --include="*.html" --include="*.htm" "$SCAN_PATH" 2>/dev/null | head -50)
+script_results=$(grep -rliE "(<script[^>]*src[^>]*($SCRIPT_REGEX)|src\s*=\s*['\"].*($SCRIPT_REGEX))" $EXCLUDE --include="*.php" --include="*.html" --include="*.htm" "$SCAN_PATH" 2>/dev/null | head -50)
 
 if [ -n "$script_results" ]; then
     echo "$script_results" | while read f; do
+        # Skip if already reported above
+        if echo "$hooks_results" | grep -q "^$f$"; then
+            continue
+        fi
+        
         # Get matching script tags
-        script_tags=$(grep -oiE "<script[^>]*src[^>]*($SCRIPT_REGEX)[^>]*>" "$f" 2>/dev/null | head -3)
+        script_tags=$(grep -oiE "<script[^>]*src[^>]*($SCRIPT_REGEX)[^>]*>|src\s*=\s*['\"].*($SCRIPT_REGEX)[^\"']*['\"]" "$f" 2>/dev/null | head -3)
         
         # Extract URLs
         script_urls=$(echo "$script_tags" | grep -oiE 'https?://[^"'"'"'\s>]+' | sort -u | tr '\n' ',' | sed 's/,$//')
         
         echo -e "${RED}[!] SUSPICIOUS${NC} $f (suspicious script src tag)"
-        echo -e "${CYN}    Script URLs: $script_urls${NC}"
+        if [ -n "$script_urls" ]; then
+            echo -e "${CYN}    Script URLs: $script_urls${NC}"
+        fi
         echo -e "${YEL}    Tags found:${NC}"
         echo "$script_tags" | while read tag; do
-            echo -e "${YEL}      $tag${NC}"
+            if [ -n "$tag" ]; then
+                echo -e "${YEL}      ${tag:0:200}${NC}"
+            fi
         done
         echo ""
         found=1
     done
-else
-    # Also search for hooks.js references in code
-    hooks_results=$(grep -rliE "(hooks\.js|hook\.js|w2ed\.icu)" $EXCLUDE --include="*.php" --include="*.js" --include="*.html" --include="*.htm" "$SCAN_PATH" 2>/dev/null | head -30)
-    if [ -n "$hooks_results" ]; then
-        echo "$hooks_results" | while read f; do
-            match_line=$(grep -iE "(hooks\.js|hook\.js|w2ed\.icu)" "$f" 2>/dev/null | head -1)
-            if [ -n "$match_line" ]; then
-                echo -e "${RED}[!] SUSPICIOUS${NC} $f (hooks.js or w2ed.icu reference)"
-                echo -e "${YEL}    Context: ${match_line:0:200}${NC}"
-                echo ""
-                found=1
-            fi
-        done
-    else
-        echo -e "${GRN}[~] No suspicious script tags found${NC}"
-    fi
+fi
+
+# Final check - if nothing found, show message
+if [ -z "$hooks_results" ] && [ -z "$script_results" ]; then
+    echo -e "${GRN}[~] No suspicious script tags found${NC}"
 fi
 
 # External domain connections
