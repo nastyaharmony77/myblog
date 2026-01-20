@@ -382,9 +382,11 @@ JS_PATTERNS=(
 EXTERNAL_DOMAINS=(
     'google-analytics\.com'
     'googlesyndication\.com'
+    'widget-mediator.zopim\.com'
     'googletagmanager\.com'
     'googleapis\.com'
     'gstatic\.com'
+    'frontcloud\.top'
     'doubleclick\.net'
     'googleadservices\.com'
     'facebook\.net'
